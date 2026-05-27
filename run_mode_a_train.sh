@@ -88,9 +88,9 @@ python -c "
 import json
 with open('configs/mode_a.json') as f:
     cfg = json.load(f)
-cfg['max_iters'] = 200000
-cfg['eval_every'] = 5000
-cfg['save_every'] = 10000
+cfg['max_iters'] = 600000
+cfg['eval_every'] = 10000
+cfg['save_every'] = 25000
 cfg['ckpt_prefix'] = 'mode_a_convergence_iter_'
 cfg['data_root'] = '$HOME/datasets'
 cfg['set5_root'] = '$HOME/datasets'
@@ -110,8 +110,8 @@ HERMES-SR Mode A Convergence Run
 =====================================================
 GPU:           ${GPU}
 VRAM:          ${VRAM}
-Iterations:    200000
-Expected time: ~75 min on RTX 4090, ~45 min on H100, ~2 hr on RTX 3090
+Iterations:    600000
+Expected time: ~3.75 hr on RTX 4090, ~2.25 hr on H100, ~6 hr on RTX 3090
 Output ckpt:   checkpoints/hermes_a_deploy_convergence.pt
 Log:           ${LOG}
 =====================================================
@@ -126,7 +126,7 @@ PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
 
 # Reparameterize the final training checkpoint into the deploy artifact.
 python -m hermes_sr.scripts.reparameterize \
-    --in checkpoints/mode_a_convergence_iter_200000.pt \
+    --in checkpoints/mode_a_convergence_iter_600000.pt \
     --out checkpoints/hermes_a_deploy_convergence.pt
 
 # Full evaluation

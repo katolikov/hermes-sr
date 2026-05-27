@@ -29,7 +29,7 @@ Datasets under `~/datasets`. On Apple Silicon set `PYTORCH_ENABLE_MPS_FALLBACK=1
 GPU server with PyTorch + CUDA already set up:
 
 ```bash
-./run_mode_a_train.sh   # 200K iters, ~75 min on RTX 4090
+./run_mode_a_train.sh   # 600K iters, ~3.75 hr on RTX 4090
 ./run_mode_b_train.sh   # 100K iters, warm-starts from Mode A
 ```
 
