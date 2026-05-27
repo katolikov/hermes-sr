@@ -1,0 +1,18 @@
+{
+    "mode": "B",
+    "upscale": 3,
+    "patch_size": 96,
+    "batch_size": 16,
+    "max_iters": 20000,
+    "eval_interval": 2000,
+    "log_interval": 200,
+    "lr": 2e-4,
+    "weights": {"pixel": 1.0, "perceptual": 0.1, "spectral": 0.05, "temporal": 0.5, "distill": 0.2},
+    "data_root": "~/datasets",
+    "set5_root": "~/datasets",
+    "eval_noise_sigma": 25.0,
+    "out_dir": "checkpoints",
+    "use_perceptual": true,
+    "amp": true,
+    "num_workers": 2
+}
