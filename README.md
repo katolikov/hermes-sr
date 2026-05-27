@@ -30,7 +30,7 @@ GPU server with PyTorch + CUDA already set up:
 
 ```bash
 ./run_mode_a_train.sh   # 600K iters, ~3.75 hr on RTX 4090
-./run_mode_b_train.sh   # 100K iters, warm-starts from Mode A
+./run_mode_b_train.sh   # 300K iters, warm-starts from Mode A, ~3.5 hr on RTX 4090
 ```
 
 Datasets auto-download to `~/datasets/`. Deploy checkpoints land at `checkpoints/hermes_*_deploy_convergence.pt`; full results at `results/`.

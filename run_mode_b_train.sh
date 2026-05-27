@@ -90,9 +90,9 @@ python -c "
 import json
 with open('configs/mode_b.json') as f:
     cfg = json.load(f)
-cfg['max_iters'] = 100000
-cfg['eval_every'] = 5000
-cfg['save_every'] = 10000
+cfg['max_iters'] = 300000
+cfg['eval_every'] = 10000
+cfg['save_every'] = 25000
 cfg['ckpt_prefix'] = 'mode_b_convergence_iter_'
 cfg['init_from'] = '$INIT_FROM'
 cfg['data_root'] = '$HOME/datasets'
@@ -113,9 +113,9 @@ HERMES-SR Mode B Convergence Run
 =====================================================
 GPU:           ${GPU}
 VRAM:          ${VRAM}
-Iterations:    100000 (warm-start)
+Iterations:    300000 (warm-start)
 Warm-start:    ${INIT_FROM}
-Expected time: ~70 min on RTX 4090, ~40 min on H100, ~2 hr on RTX 3090
+Expected time: ~3.5 hr on RTX 4090, ~2 hr on H100, ~6 hr on RTX 3090
 Output ckpt:   checkpoints/hermes_b_deploy_convergence.pt
 Log:           ${LOG}
 =====================================================
@@ -130,7 +130,7 @@ PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
 
 # Reparameterize the final training checkpoint into the deploy artifact.
 python -m hermes_sr.scripts.reparameterize \
-    --in checkpoints/mode_b_convergence_iter_100000.pt \
+    --in checkpoints/mode_b_convergence_iter_300000.pt \
     --out checkpoints/hermes_b_deploy_convergence.pt
 
 # Full evaluation at three noise levels (sigma on 0–255 scale)
