@@ -7,4 +7,6 @@ logs/
 checkpoints/hermes_a_iter*.pt
 checkpoints/hermes_b_iter*.pt
 # Reparameterized deploy checkpoints are tracked — they are the deliverable.
+# Local visual outputs of scripts/upscale.py — not tracked.
+demo/
 .DS_Store
