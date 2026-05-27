@@ -12,6 +12,7 @@ import os
 import time
 from dataclasses import asdict
 from pathlib import Path
+from typing import Mapping
 
 import torch
 import torch.nn.functional as F
@@ -63,7 +64,24 @@ def train(cfg_path: str) -> None:
         upscale=cfg["upscale"],
         in_channels=in_channels,
     )
-    model = HermesSR(model_cfg).to(device)
+
+    # Warm-start: if init_from is given, mirror the source checkpoint's
+    # reparameterized state so the trunk dw layer names line up before loading.
+    init_from = cfg.get("init_from")
+    init_reparameterized = False
+    init_state = None
+    if init_from:
+        init_path = Path(init_from).expanduser()
+        if not init_path.exists():
+            raise FileNotFoundError(f"init_from checkpoint not found: {init_path}")
+        init_ckpt = torch.load(init_path, map_location="cpu", weights_only=False)
+        init_reparameterized = bool(init_ckpt.get("reparameterized", False))
+        init_state = init_ckpt["state_dict"]
+        print(f"[hermes_sr.train] warm-starting from {init_path} (reparameterized={init_reparameterized})")
+
+    model = HermesSR(model_cfg, reparameterized=init_reparameterized).to(device)
+    if init_state is not None:
+        _load_warm_start(model, init_state)
     n_params = sum(p.numel() for p in model.parameters())
     print(f"[hermes_sr.train] model params: {n_params:,}")
 
@@ -91,10 +109,13 @@ def train(cfg_path: str) -> None:
     )
 
     max_iters = cfg.get("max_iters", 200_000)
-    eval_interval = cfg.get("eval_interval", 5_000)
-    log_interval = cfg.get("log_interval", 100)
+    # Accept eval_every (preferred for convergence configs) with eval_interval as fallback.
+    eval_interval = int(cfg.get("eval_every", cfg.get("eval_interval", 5_000)))
+    save_interval = int(cfg.get("save_every", eval_interval))
+    log_interval = int(cfg.get("log_interval", 100))
     set5_root = cfg.get("set5_root")
     eval_noise = cfg.get("eval_noise_sigma", 0.0)
+    ckpt_prefix = cfg.get("ckpt_prefix", f"hermes_{cfg['mode'].lower()}_iter")
 
     # Optional linear warmup on the temporal-loss weight. Disabled by default
     # (warmup_iters=0). If a future run plateaus before crossing bicubic at
@@ -184,18 +205,60 @@ def train(cfg_path: str) -> None:
                     noise_sigma=eval_noise,
                 )
                 print(f"iter {iter_count:>7d} | val PSNR {psnr:.3f} dB | val SSIM {ssim:.4f}")
-                ckpt_path = out_dir / f"hermes_{cfg['mode'].lower()}_iter{iter_count}.pt"
+            if iter_count % save_interval == 0 or iter_count == max_iters:
+                ckpt_path = out_dir / f"{ckpt_prefix}{iter_count}.pt"
                 torch.save(
                     {
                         "state_dict": model.state_dict(),
                         "config": asdict(model_cfg),
-                        "reparameterized": False,
+                        "reparameterized": init_reparameterized,
                         "iter": iter_count,
                     },
                     ckpt_path,
                 )
 
     print(f"[hermes_sr.train] done in {time.time() - t0:.1f}s, {iter_count} iters")
+
+
+def _load_warm_start(model: torch.nn.Module, src_state: Mapping[str, torch.Tensor]) -> None:
+    """Copy compatible tensors from src_state into model.
+
+    Same name + same shape -> direct copy.
+    Stem conv weight (target 2-channel, source 1-channel) -> copy source into
+    channel 0 of target, leave channel 1 zero. This is the Mode A -> Mode B
+    warm-start case (Mode B adds a broadcast noise-sigma channel).
+    All other shape/name mismatches are skipped with a printed note.
+    """
+    dst_state = model.state_dict()
+    copied = []
+    skipped = []
+    for k, dst in dst_state.items():
+        src = src_state.get(k)
+        if src is None:
+            skipped.append(f"{k} (missing in source)")
+            continue
+        if src.shape == dst.shape:
+            dst.copy_(src)
+            copied.append(k)
+            continue
+        # Special case: stem conv weight expanded from 1 to 2 input channels
+        if (
+            k == "stem.0.weight"
+            and src.ndim == 4
+            and dst.ndim == 4
+            and src.shape[0] == dst.shape[0]
+            and src.shape[2:] == dst.shape[2:]
+            and src.shape[1] == 1
+            and dst.shape[1] == 2
+        ):
+            dst.zero_()
+            dst[:, :1].copy_(src)
+            copied.append(f"{k} (stem 1->2ch expand)")
+            continue
+        skipped.append(f"{k} (shape {tuple(src.shape)} vs {tuple(dst.shape)})")
+    print(f"[hermes_sr.train] warm-start: copied {len(copied)} tensors, skipped {len(skipped)}")
+    for s in skipped:
+        print(f"  skip: {s}")
 
 
 def _make_uniform_hr_flow(
