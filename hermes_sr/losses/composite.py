@@ -44,6 +44,8 @@ class CompositeLoss(nn.Module):
     ) -> None:
         super().__init__()
         self.weights = {**_DEFAULT_WEIGHTS, **(weights or {})}
+        # Only load VGG if perceptual is both requested and actually weighted.
+        use_perceptual = use_perceptual and self.weights.get("perceptual", 0.0) > 0.0
         self.use_perceptual = use_perceptual
         if use_perceptual:
             vgg = torchvision.models.vgg19(weights=vgg_weights).features.eval()
@@ -76,11 +78,19 @@ class CompositeLoss(nn.Module):
         prev_pred: Optional[torch.Tensor] = None,
         flow: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, dict]:
+        # Skip the compute for any term whose weight is 0 (pure-L1 configs avoid
+        # the VGG forward and the FFT entirely — a large saving on long runs).
         parts: dict = {}
         parts["pixel"] = F.l1_loss(pred, target)
-        parts["perceptual"] = self._perceptual(pred, target)
-        parts["spectral"] = self._spectral(pred, target)
-        if prev_pred is not None and flow is not None:
+        parts["perceptual"] = (
+            self._perceptual(pred, target) if self.weights.get("perceptual", 0.0) > 0.0
+            else pred.new_zeros(())
+        )
+        parts["spectral"] = (
+            self._spectral(pred, target) if self.weights.get("spectral", 0.0) > 0.0
+            else pred.new_zeros(())
+        )
+        if self.weights.get("temporal", 0.0) > 0.0 and prev_pred is not None and flow is not None:
             parts["temporal"] = F.l1_loss(grid_warp(pred, flow), prev_pred)
         else:
             parts["temporal"] = pred.new_zeros(())

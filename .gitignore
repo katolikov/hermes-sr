@@ -10,3 +10,8 @@ checkpoints/hermes_b_iter*.pt
 # Local visual outputs of scripts/upscale.py — not tracked.
 demo/
 .DS_Store
+
+# Distillation teacher weights (large, download separately)
+teacher/
+# WIP MATLAB-imresize port (unverified)
+hermes_sr/data/imresize.py

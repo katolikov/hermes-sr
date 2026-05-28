@@ -40,10 +40,13 @@ def reparameterize_and_save(
         y_after, h_after = model(x)
 
     max_y = (y_before - y_after).abs().max().item()
-    max_h = (h_before - h_after).abs().max().item()
     assert max_y < atol, f"reconstruction diverged after reparam: max diff {max_y:.3e} >= {atol}"
-    assert max_h < atol, f"state diverged after reparam: max diff {max_h:.3e} >= {atol}"
-    print(f"[reparameterize] equivalence ok (max y diff {max_y:.3e}, max h diff {max_h:.3e})")
+    if h_before is not None and h_after is not None:
+        max_h = (h_before - h_after).abs().max().item()
+        assert max_h < atol, f"state diverged after reparam: max diff {max_h:.3e} >= {atol}"
+        print(f"[reparameterize] equivalence ok (max y diff {max_y:.3e}, max h diff {max_h:.3e})")
+    else:
+        print(f"[reparameterize] equivalence ok (max y diff {max_y:.3e}, no recurrent state)")
 
     torch.save(
         {

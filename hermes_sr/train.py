@@ -59,11 +59,19 @@ def train(cfg_path: str) -> None:
     print(f"[hermes_sr.train] device={device.type} config={cfg_path}")
 
     in_channels = 2 if cfg["mode"] == "B" else 1
-    model_cfg = HermesConfig(
-        mode=cfg["mode"],
-        upscale=cfg["upscale"],
-        in_channels=in_channels,
-    )
+    model_cfg_kwargs: dict = {
+        "mode": cfg["mode"],
+        "upscale": cfg["upscale"],
+        "in_channels": in_channels,
+    }
+    # Pass-through architecture overrides from the config file if present.
+    for key in ("kernel_size", "use_recurrent_state", "anchor_mode",
+                "trunk_channels", "ib_channels", "num_blocks",
+                "state_channels", "flow_down_factor", "flow_levels",
+                "block_type", "ecb_depth_multiplier"):
+        if key in cfg:
+            model_cfg_kwargs[key] = cfg[key]
+    model_cfg = HermesConfig(**model_cfg_kwargs)
 
     # Warm-start: if init_from is given, mirror the source checkpoint's
     # reparameterized state so the trunk dw layer names line up before loading.
@@ -150,16 +158,23 @@ def train(cfg_path: str) -> None:
             opt.zero_grad(set_to_none=True)
             ctx = torch.amp.autocast("cuda", enabled=use_amp) if use_amp else _NullCtx()
             with ctx:
-                # Previous frame: no recurrent state, no flow; cheap pass for the
-                # state hand-off and the temporal-loss reference.
-                with torch.no_grad():
-                    pred_prev, h_state = model(lr_prev)
-                pred_curr, _ = model(lr_curr, h_prev=h_state, y_prev=lr_prev[:, :1])
-
-                # Use the synthetic-known LR shift, lifted to HR pixels, for the
-                # temporal loss instead of re-running the diamond estimator.
-                shift_lr = batch["shift_lr"].to(device).float()
-                flow = _make_uniform_hr_flow(shift_lr, hr_curr.shape[-2:], cfg["upscale"]).to(device)
+                # Skip the previous-frame forward when neither the temporal loss
+                # nor the recurrent state path needs it. Pure-L1 + static-SR
+                # configs save ~50% of per-iter wall time this way.
+                need_prev = (
+                    float(loss_fn.weights.get("temporal", 0.0)) > 0.0
+                    or model.config.use_recurrent_state
+                )
+                if need_prev:
+                    with torch.no_grad():
+                        pred_prev, h_state = model(lr_prev)
+                    pred_curr, _ = model(lr_curr, h_prev=h_state, y_prev=lr_prev[:, :1])
+                    shift_lr = batch["shift_lr"].to(device).float()
+                    flow = _make_uniform_hr_flow(shift_lr, hr_curr.shape[-2:], cfg["upscale"]).to(device)
+                else:
+                    pred_curr, _ = model(lr_curr)
+                    pred_prev = None
+                    flow = None
 
                 total, parts = loss_fn(pred_curr, hr_curr, prev_pred=pred_prev, flow=flow)
 

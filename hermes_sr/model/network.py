@@ -1,12 +1,18 @@
 """Full HERMES-SR network.
 
-Mode A: Y-only input (1ch),  ×s reconstruction, 6 plain blocks.
-Mode B: Y+noise-sigma input (2ch), ×s reconstruction, 6 blocks with SimpleGate
-        residual in the last two.
+Two trunk block types, selected by HermesConfig.block_type:
+  "ecb"    : Edge-oriented Convolution Blocks (ECBSR-style). Each block collapses
+             to a dense 3x3 conv at inference — best NPU utilization (ABPN class),
+             with Sobel/Laplacian edge priors during training. Default.
+  "hermes" : the MVP depthwise-large-kernel block with inverted bottleneck.
 
-The trunk fuses a warped 16-channel recurrent state with the stem output before
-six HERMES blocks, then emits both an HR Y prediction (PixelShuffle + bicubic
-anchor) and the next-frame state.
+Mode A: Y-only input (1ch), ×s. Mode B: Y+noise-sigma input (2ch), ×s.
+
+Trunk path:
+  stem -> (optional) state_fuse with warped recurrent state -> N blocks
+  -> recon head + PixelShuffle + anchor upsample = HR Y prediction
+Recurrent state + flow path is optional (use_recurrent_state); off for static SR
+and mobile deploy. Anchor is bilinear (NPU-native) or bicubic.
 """
 from __future__ import annotations
 
@@ -18,21 +24,27 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from hermes_sr.model.blocks import HermesBlock
+from hermes_sr.model.ecb import ECB
 from hermes_sr.model.flow import DiamondSearchFlow, grid_warp
 
 
 @dataclass
 class HermesConfig:
-    mode: str = "A"            # "A" or "B"
+    mode: str = "A"
     upscale: int = 2
-    in_channels: int = 1       # 1 for Mode A, 2 for Mode B (Y + noise-sigma)
+    in_channels: int = 1
     trunk_channels: int = 32
     ib_channels: int = 128
     num_blocks: int = 6
+    block_type: str = "ecb"           # "ecb" | "hermes"
+    ecb_depth_multiplier: float = 2.0
+    kernel_size: int = 7              # only used by block_type="hermes"
     state_channels: int = 16
+    use_recurrent_state: bool = False
     flow_down_factor: int = 8
     flow_levels: int = 2
-    quantize_aware: bool = False  # TODO(QAT): structural hook only; not yet active
+    anchor_mode: str = "bilinear"     # bilinear | bicubic
+    quantize_aware: bool = False
 
 
 class HermesSR(nn.Module):
@@ -49,82 +61,91 @@ class HermesSR(nn.Module):
             nn.Conv2d(config.in_channels, c, 3, padding=1),
             nn.ReLU6(inplace=True),
         )
-        self.state_fuse = nn.Conv2d(c + sc, c, 1)
+
+        if config.use_recurrent_state:
+            self.state_fuse = nn.Conv2d(c + sc, c, 1)
+            self.state_head = nn.Conv2d(c, sc, 1)
+            self.flow_estimator = DiamondSearchFlow(
+                down_factor=config.flow_down_factor,
+                num_levels=config.flow_levels,
+            )
+        else:
+            self.state_fuse = None
+            self.state_head = None
+            self.flow_estimator = None
 
         self.blocks = nn.ModuleList()
         for i in range(config.num_blocks):
-            use_sg = (config.mode == "B") and (i >= config.num_blocks - 2)
-            self.blocks.append(
-                HermesBlock(
-                    channels=c,
-                    ib_channels=config.ib_channels,
-                    use_simple_gate=use_sg,
-                    reparameterized=reparameterized,
+            if config.block_type == "ecb":
+                self.blocks.append(
+                    ECB(c, c, depth_multiplier=config.ecb_depth_multiplier,
+                        with_idt=True, reparameterized=reparameterized)
                 )
-            )
+            elif config.block_type == "hermes":
+                use_sg = (config.mode == "B") and (i >= config.num_blocks - 2)
+                self.blocks.append(
+                    HermesBlock(channels=c, ib_channels=config.ib_channels,
+                                use_simple_gate=use_sg, reparameterized=reparameterized,
+                                kernel_size=config.kernel_size)
+                )
+            else:
+                raise ValueError(f"unknown block_type {config.block_type!r}")
 
-        self.state_head = nn.Conv2d(c, sc, 1)
         self.recon_head = nn.Conv2d(c, s * s, 3, padding=1)
+        nn.init.zeros_(self.recon_head.weight)
+        nn.init.zeros_(self.recon_head.bias)
         self.pixel_shuffle = nn.PixelShuffle(s)
 
-        self.flow_estimator = DiamondSearchFlow(
-            down_factor=config.flow_down_factor,
-            num_levels=config.flow_levels,
-        )
-
-        if config.quantize_aware:
-            # TODO(QAT): instantiate FakeQuantize stubs on the inputs/outputs of each
-            # conv when a later session activates QAT. The architecture is already
-            # free of ops that wouldn't quantize (no softmax, no in-place sigmoid,
-            # no Python control flow inside a module forward except the no-grad
-            # flow estimator, which is replaced at deploy).
-            pass
+    def _trunk(self, x: torch.Tensor) -> torch.Tensor:
+        for block in self.blocks:
+            x = block(x)
+            if self.config.block_type == "ecb":
+                x = F.relu(x)  # activation after each ECB (ECBSR-style)
+        return x
 
     def forward(
         self,
         y_lr: torch.Tensor,
         h_prev: Optional[torch.Tensor] = None,
         y_prev: Optional[torch.Tensor] = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Run one frame.
-
-        y_lr:    (N, in_channels, H, W) — Y plane, or Y+sigma for Mode B
-        h_prev:  (N, state_channels, H, W) or None (None means zeros)
-        y_prev:  (N, 1, H, W) Y plane of previous frame, or None (None disables flow)
-        """
+        return_feat: bool = False,
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         n, _, h, w = y_lr.shape
         device = y_lr.device
 
-        if h_prev is None:
-            h_prev = torch.zeros(n, self.config.state_channels, h, w, device=device, dtype=y_lr.dtype)
-        if y_prev is None:
-            flow = torch.zeros(n, 2, h, w, device=device, dtype=y_lr.dtype)
-        else:
-            # Use only the Y channel to estimate motion
-            y_only_prev = y_prev[:, :1]
-            y_only_curr = y_lr[:, :1]
-            flow = self.flow_estimator(y_only_prev, y_only_curr)
-
-        h_warped = grid_warp(h_prev, flow)
-
         x = self.stem(y_lr)
-        x = self.state_fuse(torch.cat([x, h_warped], dim=1))
-        for block in self.blocks:
-            x = block(x)
 
-        h_new = self.state_head(x)
-        residual = self.pixel_shuffle(self.recon_head(x))
+        if self.config.use_recurrent_state:
+            if h_prev is None:
+                h_prev = torch.zeros(
+                    n, self.config.state_channels, h, w, device=device, dtype=y_lr.dtype
+                )
+            if y_prev is None:
+                flow = torch.zeros(n, 2, h, w, device=device, dtype=y_lr.dtype)
+            else:
+                flow = self.flow_estimator(y_prev[:, :1], y_lr[:, :1])
+            h_warped = grid_warp(h_prev, flow)
+            x = self.state_fuse(torch.cat([x, h_warped], dim=1))
 
-        # Bicubic anchor — Y channel only, no learnable params; kept in fp32 for stability
+        feat = self._trunk(x)
+
+        h_new: Optional[torch.Tensor] = None
+        if self.config.use_recurrent_state:
+            h_new = self.state_head(feat)
+
+        residual = self.pixel_shuffle(self.recon_head(feat))
+
         y_only_lr = y_lr[:, :1]
+        anchor_mode = self.config.anchor_mode
         with torch.amp.autocast(device_type=device.type, enabled=False):
-            y_anchor = F.interpolate(
-                y_only_lr.float(),
-                scale_factor=self.config.upscale,
-                mode="bicubic",
-                align_corners=False,
-            )
+            interp_kwargs: dict = {"scale_factor": self.config.upscale, "mode": anchor_mode}
+            if anchor_mode in ("bilinear", "bicubic"):
+                interp_kwargs["align_corners"] = False
+            y_anchor = F.interpolate(y_only_lr.float(), **interp_kwargs)
         y_hr = residual + y_anchor.to(residual.dtype)
+
+        if return_feat:
+            return y_hr, h_new, feat
         return y_hr, h_new
 
     def reparameterize(self) -> None:
@@ -138,14 +159,13 @@ def count_parameters(model: nn.Module) -> int:
 
 
 if __name__ == "__main__":
-    cfg_a = HermesConfig(mode="A", upscale=2, in_channels=1)
-    cfg_b = HermesConfig(mode="B", upscale=3, in_channels=2)
-    m_a = HermesSR(cfg_a)
-    m_b = HermesSR(cfg_b)
-    n_a = count_parameters(m_a)
-    n_b = count_parameters(m_b)
-    print(f"Mode A (×{cfg_a.upscale}, in={cfg_a.in_channels}): {n_a:,} parameters")
-    print(f"Mode B (×{cfg_b.upscale}, in={cfg_b.in_channels}): {n_b:,} parameters")
-    # Spec target is ~120K with ±20% tolerance. The literal architecture (32-ch
-    # trunk, 128-ch IB) comes in lower than the target; see the parameter-count
-    # test for the asserted range.
+    import copy
+    for mode, up, inc in [("A", 2, 1), ("B", 3, 2)]:
+        cfg = HermesConfig(mode=mode, upscale=up, in_channels=inc)
+        m = HermesSR(cfg)
+        train_p = count_parameters(m)
+        m_rep = copy.deepcopy(m)
+        m_rep.reparameterize()
+        inf_p = count_parameters(m_rep)
+        print(f"Mode {mode} (×{up}, block={cfg.block_type}): "
+              f"train {train_p:,} -> inference {inf_p:,} params")
