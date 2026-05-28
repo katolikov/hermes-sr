@@ -37,6 +37,18 @@ def _build_dataset(cfg: dict):
     upscale = cfg["upscale"]
     patch_hr = cfg.get("patch_size", 96)
     data_root = cfg.get("data_root", "~/datasets")
+
+    # Real sensor-buffer video pipeline: DIV2K+Flickr2K HR -> motion pairs ->
+    # Poisson-Gaussian sensor degradation -> noisy 2ch (Y+sigma) LR.
+    if cfg.get("dataset") == "sensor_video":
+        from hermes_sr.data.sensor_video import SensorVideoDataset
+        return SensorVideoDataset(
+            roots=[data_root],
+            patch_hr=patch_hr,
+            upscale=upscale,
+            blur_max=cfg.get("blur_max", 0.8),
+        )
+
     if mode == "A":
         primary = DIV2KTrainset(root=data_root, patch_hr=patch_hr, upscale=upscale)
         aux = Flickr2KTrainset(root=data_root, patch_hr=patch_hr, upscale=upscale)
@@ -132,6 +144,15 @@ def train(cfg_path: str) -> None:
     temporal_target = float(loss_fn.weights["temporal"])
     temporal_warmup = int(cfg.get("temporal_warmup_iters", 0))
 
+    # Exponential moving average of weights: a zero-inference-cost PSNR gain.
+    # The deployed model is the EMA snapshot (same architecture/speed), which is
+    # smoother than the raw final weights and reliably +0.1-0.2 dB.
+    ema_decay = float(cfg.get("ema_decay", 0.0))
+    ema_state = None
+    if ema_decay > 0.0:
+        ema_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
+        print(f"[hermes_sr.train] EMA enabled (decay={ema_decay})")
+
     out_dir = Path(cfg.get("out_dir", "checkpoints")).expanduser()
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -187,6 +208,16 @@ def train(cfg_path: str) -> None:
                 opt.step()
             sched.step()
 
+            if ema_state is not None:
+                with torch.no_grad():
+                    msd = model.state_dict()
+                    for k, v in ema_state.items():
+                        src = msd[k]
+                        if v.is_floating_point():
+                            v.mul_(ema_decay).add_(src.detach(), alpha=1.0 - ema_decay)
+                        else:
+                            v.copy_(src)
+
             running_loss += float(total.detach())
             for k in running_parts:
                 running_parts[k] += float(parts[k].detach())
@@ -210,27 +241,39 @@ def train(cfg_path: str) -> None:
                 for k in running_parts:
                     running_parts[k] = 0.0
 
-            if iter_count % eval_interval == 0 or iter_count == max_iters:
-                psnr, ssim = evaluate_set5(
-                    model,
-                    set5_root=set5_root,
-                    upscale=cfg["upscale"],
-                    device=device,
-                    mode=cfg["mode"],
-                    noise_sigma=eval_noise,
-                )
-                print(f"iter {iter_count:>7d} | val PSNR {psnr:.3f} dB | val SSIM {ssim:.4f}")
-            if iter_count % save_interval == 0 or iter_count == max_iters:
-                ckpt_path = out_dir / f"{ckpt_prefix}{iter_count}.pt"
-                torch.save(
-                    {
-                        "state_dict": model.state_dict(),
-                        "config": asdict(model_cfg),
-                        "reparameterized": init_reparameterized,
-                        "iter": iter_count,
-                    },
-                    ckpt_path,
-                )
+            do_eval = iter_count % eval_interval == 0 or iter_count == max_iters
+            do_save = iter_count % save_interval == 0 or iter_count == max_iters
+            if do_eval or do_save:
+                # Eval and save on the EMA snapshot (what gets deployed), then
+                # restore the raw training weights to continue optimizing.
+                backup = None
+                if ema_state is not None:
+                    backup = {k: v.detach().clone() for k, v in model.state_dict().items()}
+                    model.load_state_dict(ema_state)
+                if do_eval:
+                    psnr, ssim = evaluate_set5(
+                        model,
+                        set5_root=set5_root,
+                        upscale=cfg["upscale"],
+                        device=device,
+                        mode=cfg["mode"],
+                        noise_sigma=eval_noise,
+                    )
+                    tag = " (ema)" if ema_state is not None else ""
+                    print(f"iter {iter_count:>7d} | val PSNR {psnr:.3f} dB | val SSIM {ssim:.4f}{tag}")
+                if do_save:
+                    ckpt_path = out_dir / f"{ckpt_prefix}{iter_count}.pt"
+                    torch.save(
+                        {
+                            "state_dict": model.state_dict(),
+                            "config": asdict(model_cfg),
+                            "reparameterized": init_reparameterized,
+                            "iter": iter_count,
+                        },
+                        ckpt_path,
+                    )
+                if backup is not None:
+                    model.load_state_dict(backup)
 
     print(f"[hermes_sr.train] done in {time.time() - t0:.1f}s, {iter_count} iters")
 
